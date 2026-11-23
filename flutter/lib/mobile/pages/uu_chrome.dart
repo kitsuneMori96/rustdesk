@@ -12,6 +12,7 @@ import '../../consts.dart';
 import '../../models/platform_model.dart';
 import '../../models/uu_state.dart';
 import '../auto_unlock_config.dart';
+import '../dpi_adapt.dart';
 import 'remote_page.dart';
 
 const String _kPrivacyVdImpl = 'privacy_mode_impl_virtual_display';
@@ -148,9 +149,25 @@ class _UuChromeState extends State<UuChrome> with WidgetsBindingObserver {
     _privacyFailWorker = ever(
         uuState.privacyFailureSeq, (_) => _onPrivacyHostFailure());
     _peerReadyWorker = ever(gFFI.ffiModel.pi.isSet, (bool set) {
-      if (set) _queryHostMute();
+      if (set) {
+        _queryHostMute();
+        _applyAdaptiveDisplay();
+      }
     });
     if (gFFI.ffiModel.pi.isSet.value) _queryHostMute();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyAdaptiveDisplay());
+  }
+
+  // First-connect default for the virtual display: match the phone's own
+  // physical resolution. An explicit choice in the picker always wins.
+  void _applyAdaptiveDisplay() {
+    if (!mounted || !_hostControlSupported) return;
+    if (_hostSetting('display', '').isNotEmpty) return;
+    final mode = adaptiveDisplayMode(context);
+    if (mode == null) return;
+    _setHostSetting('display', mode);
+    final (w, h) = _parseDisplayMode(mode);
+    _sendHostCmd('display:${w}x$h', true);
   }
 
   // Pull the host's real mute state on connect and on foreground resume; the
