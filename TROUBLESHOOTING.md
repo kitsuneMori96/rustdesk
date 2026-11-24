@@ -362,3 +362,38 @@ master 的 Kotlin 调了 1.5.3 里没有的 JNI（`setInputServiceOpen` 等）�
 **验证**：logcat 启动后应出现 `[uu-diag] fork latest release: v1.5.3-uu.1 (current v1.5.3-uu.1)`；同标签不出现横幅；把常量改小做临时包可验证横幅与跳转。
 
 **回归与修复（16:04）**：首版接线包（`e23c6774`）把整个连接页渲染成灰块。原因：`_buildUpdateUI` 先算 `Uri.parse(url).pathSegments.last` 再判断 `url.isEmpty`，空 URL 时 `last` 在空列表上抛 StateError，Obx 子树整体构建失败（release 下表现为灰色占位）。修法：空 URL 首行直接返回占位，标签解析改为空列表保护。`fad350dd` 已装机：首页正常、logcat 仍打印 fork latest release 行。
+
+---
+
+## 案例：被控端整机鼠标卡顿（虚拟屏重放 → 采集重启 → 掉 GDI）（2026-11-24 19:44）
+
+**现象**：手机通过 uu 客户端连上 Windows 被控端后，主机**整机**鼠标明显卡顿（不只是远控画面内）；同一台机器时好时坏。
+
+**判别（服务日志）**：读 `C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\log\server\RustDesk_rCURRENT.log`（普通权限打不开，提权复制一份），按关键词过滤：
+
+- `#displays=` 从 1 跳到 3–4；
+- `Displays changed` 后紧跟采集器 `SWITCH`；
+- 数秒后出现 `No image, fall back to gdi`，之后持续 GDI 采集 2560×1600。
+
+前两条出现即说明拓扑被虚拟屏打乱；第三条决定卡不卡——有 SWITCH 但没掉 GDI 时不卡。
+
+**根因链**：
+
+1. 手机端把工具栏「虚拟屏 +」的结果持久化在会话选项 `virtual-display` 里；
+2. 客户端 `send_toggle_virtual_display_msg`（`src/client/io_loop.rs`）在收到首帧后按该选项逐条重放 `ToggleVirtualDisplay{on:true}`；
+3. 主机 `toggle_virtual_display` → `virtual_display_manager::plug_in_monitor` 每请求一次插一块 Amyuni 虚拟屏（上限 4）；
+4. 拓扑 1→4 触发视频服务 SWITCH、重建采集器；新 DXGI 采集器在 `DXGI_RECOVERY_FRAME_GRACE`（2 秒）宽限期内拿不到帧，永久退回 GDI；
+5. GDI 2560×1600@30fps 软拷贝吃满主机，表现为整机鼠标卡。
+
+**规避（已实测有效）**：在**保持连接**的状态下，把手机端虚拟屏计数减到 0（或点「全部拔出」），**确认计数为 0 后再断开重连**。断开状态下操作无效，重连会重放旧条目。按此法重连后日志全程 `#displays=1`，0 次 SWITCH、0 次 `access lost`、0 次 `fall back to gdi`，鼠标第一秒起就流畅。
+
+**易误判**：开关防窥会经 DisplayConfig 顺手清掉多余虚拟屏，于是出现「开一下/关一下防窥鼠标就好了」的假象——好的原因是虚拟屏被清了，不是防窥修好了采集。
+
+**代码出处**：上述重放、采集重启、GDI 回退在 rustdesk/rustdesk `1.5.3` 中同样存在；本 fork 改动前提交的 `src/client/io_loop.rs` 与 `src/server/video_service.rs` 与上游逐字节一致（0 行差异），不是本 fork 引入的。
+
+**未走代码层修复的原因**：
+
+- 客户端不重放 `virtual-display`：改动小，但会改掉 uu 的「恢复上次虚拟屏」交互，属于产品决策；
+- 采集侧（拓扑变化不重建 / 新采集器失败时保留旧采集器 / GDI 换 WGC）：能治根，但要动采集生命周期，跨平台跨显卡，单机复现不足以支撑，维护者无法复现时不宜提交；
+- 试过的「宽限期加长」不是真修复（只降低概率），已撤回。
+
