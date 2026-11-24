@@ -61,6 +61,7 @@ pub struct PrivacyModeImpl {
     displays: Vec<Display>,
     virtual_displays: Vec<Display>,
     virtual_displays_added: Vec<u32>,
+    display_config_restore: Option<display_config::Saved>,
 }
 
 struct TurnOnGuard<'a> {
@@ -100,6 +101,7 @@ impl PrivacyModeImpl {
             displays: Vec::new(),
             virtual_displays: Vec::new(),
             virtual_displays_added: Vec::new(),
+            display_config_restore: None,
         }
     }
 
@@ -315,7 +317,30 @@ impl PrivacyModeImpl {
     // NOTE: We can't detect if the other virtual displays are physical displays or not.
     // We can only use `DeviceString` == `virtual_display_manager::get_cur_device_string()` to detect if the display is a virtual display.
     // The other virtual displays can't be restored after exiting the privacy mode on Windows 24H2.
-    fn disable_physical_displays(&self) -> ResultType<()> {
+    fn disable_physical_displays(&mut self, keep: &str) -> ResultType<bool> {
+        match self.stage_disable_physical_displays() {
+            Ok(()) => Ok(false),
+            Err(e) => {
+                log::warn!(
+                    "Legacy display detach failed ({}), retrying via DisplayConfig",
+                    e
+                );
+                let (width, height) = desired_mode();
+                if let Err(e) =
+                    crate::platform::change_resolution(keep, width as usize, height as usize)
+                {
+                    log::warn!(
+                        "Failed to set virtual display resolution before DisplayConfig: {e}"
+                    );
+                }
+                self.display_config_restore =
+                    Some(display_config::deactivate_non_virtual(&[keep.to_owned()])?);
+                Ok(true)
+            }
+        }
+    }
+
+    fn stage_disable_physical_displays(&self) -> ResultType<()> {
         for display in &self.displays {
             let mut dm = display.dm.clone();
             unsafe {
@@ -491,6 +516,9 @@ impl PrivacyModeImpl {
     }
 
     fn restore(&mut self) {
+        if let Some(saved) = self.display_config_restore.take() {
+            allow_err!(display_config::restore(&saved));
+        }
         Self::restore_displays(&self.displays);
         Self::restore_displays(&self.virtual_displays);
         allow_err!(Self::commit_change_display(0));
@@ -580,17 +608,21 @@ impl PrivacyMode for PrivacyModeImpl {
         // fail once with `ret: -1` and no system error; retry inside the host
         // instead of leaving the client to retry and show a failure dialog.
         let mut primary_display_name = String::new();
+        let mut display_config_active = false;
         let mut last_err = String::new();
         for attempt in 0..4 {
-            let res = (|| -> ResultType<String> {
+            let res = (|| -> ResultType<(String, bool)> {
                 let name = guard.set_primary_display()?;
-                guard.disable_physical_displays()?;
-                Self::commit_change_display(CDS_RESET)?;
-                Ok(name)
+                let used_display_config = guard.disable_physical_displays(&name)?;
+                if !used_display_config {
+                    Self::commit_change_display(CDS_RESET)?;
+                }
+                Ok((name, used_display_config))
             })();
             match res {
-                Ok(name) => {
+                Ok((name, used_display_config)) => {
                     primary_display_name = name;
+                    display_config_active = used_display_config;
                     last_err.clear();
                     break;
                 }
@@ -608,16 +640,20 @@ impl PrivacyMode for PrivacyModeImpl {
         if !last_err.is_empty() {
             bail!("Failed ChangeDisplaySettingsEx, {}", last_err);
         }
-        // Displays that only existed as attached-but-inactive entries (stale
-        // virtual monitors from other IDD drivers) get activated by the reset.
-        allow_err!(guard.disable_extra_displays(&primary_display_name));
-        // Explicitly set the resolution(virtual display) to the size chosen by the client.
-        let (width, height) = desired_mode();
-        allow_err!(crate::platform::change_resolution(
-            &primary_display_name,
-            width as usize,
-            height as usize
-        ));
+        if display_config_active {
+            log::info!("DisplayConfig privacy layout committed; skipping topology-reset cleanup");
+        } else {
+            // Displays that only existed as attached-but-inactive entries (stale
+            // virtual monitors from other IDD drivers) get activated by the reset.
+            allow_err!(guard.disable_extra_displays(&primary_display_name));
+            // Explicitly set the resolution(virtual display) to the size chosen by the client.
+            let (width, height) = desired_mode();
+            allow_err!(crate::platform::change_resolution(
+                &primary_display_name,
+                width as usize,
+                height as usize
+            ));
+        }
         let reg_connectivity_2 = reg_display_settings::read_reg_connectivity()?;
 
         if let Some(reg_recovery) =
@@ -710,4 +746,130 @@ pub fn restore_reg_connectivity(plug_out_monitors: bool, force: bool) {
         }
     }
     reset_config_reg_connectivity();
+}
+
+mod display_config {
+    use hbb_common::{bail, log, ResultType};
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO,
+        DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ONLY_ACTIVE_PATHS,
+        SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SET_DISPLAY_CONFIG_FLAGS,
+    };
+    use windows::Win32::Foundation::{ERROR_SUCCESS, POINTL};
+
+    pub(super) struct Saved {
+        paths: Vec<DISPLAYCONFIG_PATH_INFO>,
+        modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    }
+
+    fn apply_flags() -> SET_DISPLAY_CONFIG_FLAGS {
+        SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_APPLY | SDC_ALLOW_CHANGES
+    }
+
+    fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+        let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        name.header = DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: path.sourceInfo.adapterId,
+            id: path.sourceInfo.id,
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0 {
+            return None;
+        }
+        let len = name
+            .viewGdiDeviceName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(name.viewGdiDeviceName.len());
+        Some(String::from_utf16_lossy(&name.viewGdiDeviceName[..len]))
+    }
+
+    // Some OS/driver combinations refuse the legacy "zero-size mode" detach
+    // with DISP_CHANGE_FAILED when the physical display is the only primary
+    // output; dropping its path through DisplayConfig (what the Settings app
+    // does) still works.
+    pub(super) fn deactivate_non_virtual(virtual_names: &[String]) -> ResultType<Saved> {
+        unsafe {
+            let mut npaths = 0u32;
+            let mut nmodes = 0u32;
+            let err = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut npaths, &mut nmodes);
+            if err != ERROR_SUCCESS || npaths == 0 {
+                bail!("GetDisplayConfigBufferSizes failed: {}", err.0);
+            }
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); npaths as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nmodes as usize];
+            let err = QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut npaths,
+                paths.as_mut_ptr(),
+                &mut nmodes,
+                modes.as_mut_ptr(),
+                None::<*mut DISPLAYCONFIG_TOPOLOGY_ID>,
+            );
+            if err != ERROR_SUCCESS {
+                bail!("QueryDisplayConfig failed: {}", err.0);
+            }
+            paths.truncate(npaths as usize);
+            modes.truncate(nmodes as usize);
+            let saved = Saved {
+                paths: paths.clone(),
+                modes: modes.clone(),
+            };
+
+            let mut kept = Vec::new();
+            let mut x = 0;
+            for path in &paths {
+                let Some(gdi) = source_name(path) else {
+                    continue;
+                };
+                if !virtual_names.iter().any(|n| n.eq_ignore_ascii_case(&gdi)) {
+                    continue;
+                }
+                let idx = path.sourceInfo.Anonymous.modeInfoIdx as usize;
+                let width = if idx < modes.len()
+                    && modes[idx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                {
+                    let mut source = modes[idx].Anonymous.sourceMode;
+                    source.position = POINTL { x, y: 0 };
+                    modes[idx].Anonymous.sourceMode = source;
+                    source.width
+                } else {
+                    0
+                };
+                x += width as i32;
+                kept.push(*path);
+            }
+            if kept.is_empty() {
+                bail!("No active path for the virtual display");
+            }
+
+            let rc = SetDisplayConfig(Some(kept.as_slice()), Some(modes.as_slice()), apply_flags());
+            if rc != 0 {
+                bail!("SetDisplayConfig failed: {}", rc);
+            }
+            log::info!(
+                "Deactivated {} non-selected display path(s) via DisplayConfig",
+                paths.len() - kept.len()
+            );
+            Ok(saved)
+        }
+    }
+
+    pub(super) fn restore(saved: &Saved) -> ResultType<()> {
+        let rc = unsafe {
+            SetDisplayConfig(
+                Some(saved.paths.as_slice()),
+                Some(saved.modes.as_slice()),
+                apply_flags(),
+            )
+        };
+        if rc != 0 {
+            bail!("SetDisplayConfig restore failed: {}", rc);
+        }
+        Ok(())
+    }
 }
