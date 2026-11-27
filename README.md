@@ -1,6 +1,6 @@
 > **本仓库说明（Fork）**
 >
-> 本项目基于 [RustDesk](https://github.com/rustdesk/rustdesk) 1.5.3 做个人自用分支，把手机端交互按网易 UU 远程 1:1 复刻，用于自建远控替代。上游 README 原样保留在下方。
+> 本项目基于 [RustDesk](https://github.com/rustdesk/rustdesk) 1.5.3 做个人自用分支，把手机端交互按网易 UU 远程复刻，用于自建远控替代。上游 README 原样保留在下方。
 >
 > - 分支：`local/1.5.3-android`
 > - 下载：[Releases](https://github.com/kitsuneMori96/rustdesk/releases) —— `*-android-arm64-*.apk` 为手机端，`*-host-win64-*.zip` 为 Windows 被控端（含自编译 DLL），请成对使用
