@@ -25,6 +25,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'common.dart';
 import 'consts.dart';
+import 'mobile/dpi_adapt.dart';
 import 'mobile/pages/home_page.dart';
 import 'mobile/pages/server_page.dart';
 import 'mobile/widgets/deploy_dialog.dart';
@@ -520,7 +521,7 @@ class _AppState extends State<App> with WidgetsBindingObserver {
               ? (context, child) => AccessibilityListener(
                     child: MediaQuery(
                       data: MediaQuery.of(context).copyWith(
-                        textScaler: TextScaler.linear(1.0),
+                        textScaler: adaptiveTextScaler(context),
                       ),
                       child: child ?? Container(),
                     ),
