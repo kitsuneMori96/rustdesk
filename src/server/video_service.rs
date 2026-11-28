@@ -77,6 +77,7 @@ const DXGI_RECOVERY_FRAME_GRACE: Duration = Duration::from_secs(2);
 struct DxgiRecoveryState {
     attempts: usize,
     window_started: Option<Instant>,
+    restart_pending: bool,
     fallback_pending: bool,
 }
 
@@ -86,6 +87,7 @@ impl DxgiRecoveryState {
         Self {
             attempts: 0,
             window_started: None,
+            restart_pending: false,
             fallback_pending: false,
         }
     }
@@ -104,7 +106,12 @@ impl DxgiRecoveryState {
             return None;
         }
         self.attempts += 1;
+        self.restart_pending = true;
         Some(self.attempts)
+    }
+
+    fn take_restart_pending(&mut self) -> bool {
+        std::mem::take(&mut self.restart_pending)
     }
 
     fn take_fallback_pending(&mut self) -> bool {
@@ -624,8 +631,14 @@ fn run(vs: VideoService) -> ResultType<()> {
     let sp = vs.sp;
     let mut c = get_capturer(vs.source, display_idx, last_portable_service_running)?;
     #[cfg(windows)]
-    // Give a new DXGI capturer time to produce its first frame before falling back to GDI.
-    let dxgi_recovery_started = Some(Instant::now());
+    // ACCESS_LOST marks the next successful capturer creation as a recovery. This timestamp is
+    // consumed once and temporarily holds off the normal WouldBlock-to-GDI fallback, giving the
+    // replacement DXGI capturer time to produce its first frame. Normal startup is unaffected.
+    let dxgi_recovery_started = dxgi_recovery_state
+        .lock()
+        .unwrap()
+        .take_restart_pending()
+        .then(Instant::now);
     #[cfg(windows)]
     if dxgi_recovery_state.lock().unwrap().take_fallback_pending() {
         c.set_gdi();
